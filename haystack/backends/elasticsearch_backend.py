@@ -1011,4 +1011,4 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
 
 class ElasticsearchSearchEngine(BaseEngine):
     backend = ElasticsearchSearchBackend
-    query = ElasticsearchSearchQue
+    query = ElasticsearchSearchQuery
