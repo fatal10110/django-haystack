@@ -1,5 +1,30 @@
-from __future__ import unicode_literals
+"""
+ This is the basis for an elasticsearch 1.x backend I've cobbled together and am continuing 
+ to refine and test for use. It's based on haystack master's version as of:
+    - https://github.com/toastdriven/django-haystack/blob/cbb72b3253404ba21e20860f620774f7b7b691d0/haystack/backends/elasticsearch_backend.py
+ But with @HonzaKral and @davedash's work to make the backend behave more like an ES user would expect with regard to doc types:
+    - https://github.com/toastdriven/django-haystack/pull/921
 
+ I also made a number of changes:
+    - I fixed bugs that I found in #921 (mostly related to mapping synchronization issues), 
+      all of which I wrote up as comments on #921
+    - I'm using the non-django six library (because I happen to be running this on Django 1.3, 
+      but you can import django's six instead if you want. Should be drop-in)
+    - I translate "score" in order_by clauses to "_score" cause it made some code I share 
+      with a solr backend easier.
+ 
+ At this point my testing has been pretty broad, but not very deep. I think index updates and 
+ rebuilds work well, I'm fairly confident that the mapping synchronization works better than
+ any elasticsearch backend implementation I've found in the haystack commit tree. The models
+ I tested with are fairly wide and complex, but I'm sure didn't cover every data type.
+ Also, in my testing I'm running against an unmodified Haystack v2.0.0, elasticsearch 1.0.1,
+ and Django 1.3.X, but it ought to work in later versions of all. I'm not positive that 
+ I haven't broken py3 compatibility but I tried not to violate it while making changes.
+ 
+ If you use this and find issues, please let me know!
+"""
+
+from __future__ import unicode_literals
 import datetime
 import re
 import warnings
@@ -7,16 +32,14 @@ import warnings
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models.loading import get_model
-from django.utils import six
-
+import six
 import haystack
 from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, log_query
-from haystack.constants import DEFAULT_OPERATOR, DJANGO_CT, DJANGO_ID, ID
+from haystack.constants import DJANGO_CT, DJANGO_ID, DEFAULT_OPERATOR
 from haystack.exceptions import MissingDependency, MoreLikeThisError
-from haystack.inputs import Clean, Exact, PythonData, Raw
+from haystack.inputs import PythonData, Clean, Exact, Raw
 from haystack.models import SearchResult
 from haystack.utils import log as logging
-from haystack.utils import get_identifier, get_model_ct
 
 try:
     import elasticsearch
@@ -54,13 +77,13 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 "analyzer": {
                     "ngram_analyzer": {
                         "type": "custom",
-                        "tokenizer": "lowercase",
-                        "filter": ["haystack_ngram"]
+                        "tokenizer": "standard",
+                        "filter": ["haystack_ngram", "lowercase"]
                     },
                     "edgengram_analyzer": {
                         "type": "custom",
-                        "tokenizer": "lowercase",
-                        "filter": ["haystack_edgengram"]
+                        "tokenizer": "standard",
+                        "filter": ["haystack_edgengram", "lowercase"]
                     }
                 },
                 "tokenizer": {
@@ -111,40 +134,80 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         """
         Defers loading until needed.
         """
-        # Get the existing mapping & cache it. We'll compare it
-        # during the ``update`` & if it doesn't match, we'll put the new
-        # mapping.
+        # Get the existing mapping & cache it. We'll compare it during the
+        # ``update`` & if it doesn't match, we'll put the new mapping.
         try:
-            self.existing_mapping = self.conn.indices.get_mapping(index=self.index_name)
-        except NotFoundError:
+            raw_mapping_result = self.conn.indices.get_mapping(index=self.index_name)
+            self.existing_mapping = raw_mapping_result[self.index_name]['mappings']
+        except (elasticsearch.NotFoundError, KeyError):
+            # NotFoundError means the doc_type isn't in the index yet
+            # KeyError means the index doesn't exist yet
             pass
-        except Exception:
-            if not self.silently_fail:
-                raise
+
+        mappings_to_put = {}
 
         unified_index = haystack.connections[self.connection_alias].get_unified_index()
-        self.content_field_name, field_mapping = self.build_schema(unified_index.all_searchfields())
-        current_mapping = {
-            'modelresult': {
-                'properties': field_mapping,
-                '_boost': {
-                    'name': 'boost',
-                    'null_value': 1.0
+        
+        # Sigh... https://github.com/toastdriven/django-haystack/pull/851
+        if not unified_index._built:
+            unified_index.build()
+
+        # Get mappings for all ElasticSearch types/models
+        for model, index in unified_index.indexes.items():
+            es_type = self.get_es_type(index)
+
+            self.content_field_name, field_mapping = self.build_schema(index.fields)
+
+            # construct whole mapping for the es type:
+            current_mapping = {
+                es_type: {
+                    'properties': field_mapping,
+                    '_boost': {
+                        'name': 'boost',
+                        'null_value': 1.0
+                    }
                 }
             }
-        }
 
-        if current_mapping != self.existing_mapping:
+            if current_mapping[es_type] != self.existing_mapping.get(es_type, {}):
+                mappings_to_put.update(current_mapping)
+
+        if not self.existing_mapping or mappings_to_put:
+
             try:
-                # Make sure the index is there first.
+                # Make sure the index is there first, ignore 400 - index already created
                 self.conn.indices.create(index=self.index_name, body=self.DEFAULT_SETTINGS, ignore=400)
-                self.conn.indices.put_mapping(index=self.index_name, doc_type='modelresult', body=current_mapping)
-                self.existing_mapping = current_mapping
-            except Exception:
+                # create and store the mappings
+                for es_type, mapping in mappings_to_put.items():
+                    self.conn.indices.put_mapping(index=self.index_name, doc_type=es_type, body={es_type: mapping})
+                    self.existing_mapping[es_type] = mapping
+            except elasticsearch.TransportError:
                 if not self.silently_fail:
                     raise
-
         self.setup_complete = True
+
+    def get_es_type(self, index_or_model):
+        """
+        Get the ElasticSearch document 'type' that is bound to a given
+        index/model.
+        """
+        if not hasattr(index_or_model, '_meta'):
+            index_or_model = index_or_model.get_model()
+
+        return index_or_model._meta.db_table
+
+    def get_type_and_id(self, obj_or_string):
+        """
+        Return a tuple of document type and document id given an object or string
+        reprsenting an object.
+        """
+        if hasattr(obj_or_string, '_meta'):
+            doc_id = '.'.join((obj_or_string._meta.app_label, obj_or_string._meta.module_name, str(obj_or_string.pk)))
+            doc_type = self.get_es_type(obj_or_string)
+        else:
+            doc_id = obj_or_string
+            doc_type = self.get_es_type(get_model(*obj_or_string.split('.')[:2]))
+        return doc_type, doc_id
 
     def update(self, index, iterable, commit=True):
         if not self.setup_complete:
@@ -160,50 +223,31 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         prepped_docs = []
 
         for obj in iterable:
-            try:
-                prepped_data = index.full_prepare(obj)
-                final_data = {}
+            prepped_data = index.full_prepare(obj)
+            final_data = {}
 
-                # Convert the data to make sure it's happy.
-                for key, value in prepped_data.items():
-                    final_data[key] = self._from_python(value)
-                final_data['_id'] = final_data[ID]
+            # Convert the data to make sure it's happy.
+            for key, value in prepped_data.items():
+                final_data[key] = self._from_python(value)
+            final_data['_type'], final_data['_id'] = self.get_type_and_id(obj)
 
-                prepped_docs.append(final_data)
-            except elasticsearch.TransportError as e:
-                if not self.silently_fail:
-                    raise
+            del final_data['id']
 
-                # We'll log the object identifier but won't include the actual object
-                # to avoid the possibility of that generating encoding errors while
-                # processing the log message:
-                self.log.error(u"%s while preparing object for update" % e.__class__.__name__, exc_info=True, extra={
-                    "data": {
-                        "index": index,
-                        "object": get_identifier(obj)
-                    }
-                })
+            prepped_docs.append(final_data)
 
-        bulk_index(self.conn, prepped_docs, index=self.index_name, doc_type='modelresult')
+        bulk_index(self.conn, prepped_docs, index=self.index_name)
 
         if commit:
             self.conn.indices.refresh(index=self.index_name)
 
     def remove(self, obj_or_string, commit=True):
-        doc_id = get_identifier(obj_or_string)
+        doc_type, doc_id = self.get_type_and_id(obj_or_string)
 
         if not self.setup_complete:
-            try:
-                self.setup()
-            except elasticsearch.TransportError as e:
-                if not self.silently_fail:
-                    raise
-
-                self.log.error("Failed to remove document '%s' from Elasticsearch: %s", doc_id, e)
-                return
+            self.setup()
 
         try:
-            self.conn.delete(index=self.index_name, doc_type='modelresult', id=doc_id, ignore=404)
+            self.conn.delete(index=self.index_name, doc_type=doc_type, id=doc_id, ignore=404)
 
             if commit:
                 self.conn.indices.refresh(index=self.index_name)
@@ -225,23 +269,35 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 self.setup_complete = False
                 self.existing_mapping = {}
             else:
-                models_to_delete = []
 
-                for model in models:
-                    models_to_delete.append("%s:%s" % (DJANGO_CT, get_model_ct(model)))
+                models_to_delete = [self.get_es_type(m) for m in models]
+                for m in models_to_delete:
+                    self.conn.indices.delete_mapping(index=self.index_name, doc_type=m, ignore=404)
+                    if m in self.existing_mapping:
+                        del self.existing_mapping[m]
+                if commit:
+                    self.conn.indices.refresh(index=self.index_name, ignore=404)
 
-                # Delete by query in Elasticsearch asssumes you're dealing with
-                # a ``query`` root object. :/
-                query = {'query': {'query_string': {'query': " OR ".join(models_to_delete)}}}
-                self.conn.delete_by_query(index=self.index_name, doc_type='modelresult', body=query)
         except elasticsearch.TransportError as e:
             if not self.silently_fail:
                 raise
 
-            if len(models):
+            if models:
                 self.log.error("Failed to clear Elasticsearch index of models '%s': %s", ','.join(models_to_delete), e)
             else:
                 self.log.error("Failed to clear Elasticsearch index: %s", e)
+
+    def build_models_list(self):
+        """
+        overridden here because we need to use self.get_es_type()
+        """
+        from haystack import connections
+        models = []
+
+        for model in connections[self.connection_alias].get_unified_index().get_indexed_models():
+            models.append(self.get_es_type(model))
+
+        return models
 
     def build_search_kwargs(self, query_string, sort_by=None, start_offset=0, end_offset=None,
                             fields='', highlight=False, facets=None,
@@ -299,6 +355,10 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                         warnings.warn("In order to sort by distance, you must call the '.distance(...)' method.")
 
                     # Regular sorting.
+                    ## TODO: From Phill, consider the change we'd picked from another bug:
+                    ## sort_kwargs = {field: {'order': direction, 'missing' : '_last' , 'ignore_unmapped' : True}}
+                    ## (it mattered for patients sorting by 'interesting', which wasn't on all models)
+
                     sort_kwargs = {field: {'order': direction}}
 
                 order_list.append(sort_kwargs)
@@ -395,7 +455,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             limit_to_registered_models = getattr(settings, 'HAYSTACK_LIMIT_TO_REGISTERED_MODELS', True)
 
         if models and len(models):
-            model_choices = sorted(get_model_ct(model) for model in models)
+            model_choices = [self.get_es_type(model) for model in models]
         elif limit_to_registered_models:
             # Using narrow queries, limit the results to only models handled
             # with the current routers.
@@ -404,7 +464,12 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             model_choices = []
 
         if len(model_choices) > 0:
-            filters.append({"terms": {DJANGO_CT: model_choices}})
+
+            if narrow_queries is None:
+                narrow_queries = set()
+
+            # we could put these in the url but it's equivalent to the terms filter which is easier
+            filters.append({"terms": {'_type': model_choices}})
 
         for q in narrow_queries:
             filters.append({
@@ -488,9 +553,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             search_kwargs['size'] = end_offset - start_offset
 
         try:
-            raw_results = self.conn.search(body=search_kwargs,
-                                           index=self.index_name,
-                                           doc_type='modelresult')
+            raw_results = self.conn.search(body=search_kwargs, index=self.index_name)
         except elasticsearch.TransportError as e:
             if not self.silently_fail:
                 raise
@@ -525,10 +588,10 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if end_offset is not None:
             params['search_size'] = end_offset - start_offset
 
-        doc_id = get_identifier(model_instance)
+        doc_type, doc_id = self.get_type_and_id(model_instance)
 
         try:
-            raw_results = self.conn.mlt(index=self.index_name, doc_type='modelresult', id=doc_id, mlt_fields=[field_name], **params)
+            raw_results = self.conn.mlt(index=self.index_name, doc_type=doc_type, id=doc_id, mlt_fields=[field_name], **params)
         except elasticsearch.TransportError as e:
             if not self.silently_fail:
                 raise
@@ -709,12 +772,12 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 #            the right type of storage?
 DEFAULT_FIELD_MAPPING = {'type': 'string', 'analyzer': 'snowball'}
 FIELD_MAPPINGS = {
-    'edge_ngram': {'type': 'string', 'analyzer': 'edgengram_analyzer'},
-    'ngram':      {'type': 'string', 'analyzer': 'ngram_analyzer'},
+    'edge_ngram': {'type': 'string', 'analyzer': 'edgengram_analyzer'},        
+    'ngram':      {'type': 'string', 'analyzer': 'ngram_analyzer'},        
     'date':       {'type': 'date'},
     'datetime':   {'type': 'date'},
 
-    'location':   {'type': 'geo_point'},
+    'location':   {'type': 'geo_point'},        
     'boolean':    {'type': 'boolean'},
     'float':      {'type': 'float'},
     'long':       {'type': 'long'},
@@ -865,6 +928,11 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
                 if field.startswith('-'):
                     direction = 'desc'
                     field = field[1:]
+                
+                ## PT: I just made this change to make our Solr+ES lives easier
+                if field == 'score':
+                    field = '_score'
+
                 order_by_list.append((field, direction))
 
             search_kwargs['sort_by'] = order_by_list
