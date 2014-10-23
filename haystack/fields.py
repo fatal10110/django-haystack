@@ -364,7 +364,9 @@ class MultiValueField(SearchField):
             return None
 
         return list(value)
-
+    
+class MultiValueIntegerField(MultiValueField):
+    field_type = 'integer'
 
 class FacetField(SearchField):
     """
